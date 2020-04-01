@@ -442,7 +442,7 @@ STATUS iceAgentStartAgent(PIceAgent pIceAgent, PCHAR remoteUsername, PCHAR remot
     locked = FALSE;
 
     CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle,
-                                  0,
+                                  KVS_ICE_DEFAULT_TIMER_START_DELAY,
                                   pIceAgent->kvsRtcConfiguration.iceConnectionCheckPollingInterval,
                                   iceAgentStateTransitionTimerCallback,
                                   (UINT64) pIceAgent,
@@ -491,7 +491,7 @@ STATUS iceAgentStartGathering(PIceAgent pIceAgent)
     pIceAgent->candidateGatheringEndTime = GETTIME() + pIceAgent->kvsRtcConfiguration.iceLocalCandidateGatheringTimeout;
 
     CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle,
-                                  0,
+                                  KVS_ICE_DEFAULT_TIMER_START_DELAY,
                                   KVS_ICE_GATHER_CANDIDATE_TIMER_POLLING_INTERVAL,
                                   iceAgentGatherCandidateTimerCallback,
                                   (UINT64) pIceAgent,
@@ -592,8 +592,12 @@ CleanUp:
 STATUS iceAgentShutdown(PIceAgent pIceAgent)
 {
     STATUS retStatus = STATUS_SUCCESS;
+    BOOL locked = FALSE;
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
+
+    MUTEX_LOCK(pIceAgent->lock);
+    locked = TRUE;
 
     if (pIceAgent->iceAgentStateTimerTask != UINT32_MAX) {
         CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->iceAgentStateTimerTask, (UINT64) pIceAgent));
@@ -604,6 +608,8 @@ STATUS iceAgentShutdown(PIceAgent pIceAgent)
         CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->keepAliveTimerTask, (UINT64) pIceAgent));
         pIceAgent->keepAliveTimerTask = UINT32_MAX;
     }
+    MUTEX_UNLOCK(pIceAgent->lock);
+    locked = FALSE;
 
     // free turn allocation
     if (pIceAgent->turnConnectionTracker.pTurnConnection != NULL) {
@@ -624,6 +630,10 @@ STATUS iceAgentShutdown(PIceAgent pIceAgent)
 CleanUp:
 
     CHK_LOG_ERR_NV(retStatus);
+
+    if (locked) {
+        MUTEX_UNLOCK(pIceAgent->lock);
+    }
 
     return retStatus;
 }
@@ -1183,7 +1193,7 @@ STATUS iceAgentGatherCandidateTimerCallback(UINT32 timerId, UINT64 currentTime, 
     UNUSED_PARAM(timerId);
     STATUS retStatus = STATUS_SUCCESS;
     PIceAgent pIceAgent = (PIceAgent) customData;
-    BOOL locked = FALSE;
+    BOOL locked = FALSE, stopScheduling = FALSE;
     PDoubleListNode pCurNode = NULL;
     UINT64 data;
     PIceCandidate pIceCandidate = NULL;
@@ -1219,10 +1229,15 @@ STATUS iceAgentGatherCandidateTimerCallback(UINT32 timerId, UINT64 currentTime, 
         }
     }
 
+    // keep sending binding request if there is still pending srflx candidate
+    if (pendingSrflxCandidateCount > 0) {
+        CHK_STATUS(iceAgentSendSrflxCandidateRequest(pIceAgent));
+    }
+
     // stop scheduling if there is no more pending candidate or if timeout is reached.
     if (pendingCandidateCount == 0 || currentTime >= pIceAgent->candidateGatheringEndTime) {
         DLOGD("Candidate gathering completed.");
-        retStatus = STATUS_TIMER_QUEUE_STOP_SCHEDULING;
+        stopScheduling = TRUE;
         pIceAgent->iceCandidateGatheringTimerTask = UINT32_MAX;
         ATOMIC_STORE_BOOL(&pIceAgent->candidateGatheringFinished, TRUE);
         // notify that candidate gathering is finished.
@@ -1231,19 +1246,15 @@ STATUS iceAgentGatherCandidateTimerCallback(UINT32 timerId, UINT64 currentTime, 
         }
     }
 
-    // keep sending binding request if there is still pending srflx candidate
-    if (pendingSrflxCandidateCount > 0) {
-        CHK_STATUS(iceAgentSendSrflxCandidateRequest(pIceAgent));
-    }
-
 CleanUp:
 
-    if (retStatus != STATUS_TIMER_QUEUE_STOP_SCHEDULING) {
-        CHK_LOG_ERR_NV(retStatus);
+    CHK_LOG_ERR_NV(retStatus);
 
-        if (STATUS_FAILED(retStatus)) {
-            iceAgentFatalError(pIceAgent, retStatus);
-        }
+    if (STATUS_FAILED(retStatus)) {
+        iceAgentFatalError(pIceAgent, retStatus);
+    }
+    if (stopScheduling) {
+        retStatus = STATUS_TIMER_QUEUE_STOP_SCHEDULING;
     }
 
     if (locked) {
@@ -1394,8 +1405,6 @@ STATUS iceAgentInitRelayCandidate(PIceAgent pIceAgent)
             CHK_STATUS(createSocketConnection(&pNewCandidate->ipAddress, &pIceAgent->iceServers[j].ipAddress, KVS_ICE_DEFAULT_TURN_PROTOCOL,
                                               (UINT64) pIceAgent, incomingRelayedDataHandler, pIceAgent->kvsRtcConfiguration.sendBufSize,
                                               &pNewCandidate->pSocketConnection));
-            CHK_STATUS(connectionListenerAddConnection(pIceAgent->pConnectionListener,
-                                                       pNewCandidate->pSocketConnection));
 
             pNewCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_RELAYED;
             pNewCandidate->state = ICE_CANDIDATE_STATE_NEW;
@@ -1409,6 +1418,7 @@ STATUS iceAgentInitRelayCandidate(PIceAgent pIceAgent)
             pIceAgent->turnConnectionTracker.pRelayCandidate = pNewCandidate;
 
             MUTEX_LOCK(pIceAgent->lock);
+            locked = TRUE;
 
             CHK_STATUS(doubleListInsertItemHead(pIceAgent->localCandidates, (UINT64) pNewCandidate));
             pNewCandidate = NULL;
@@ -1425,10 +1435,10 @@ STATUS iceAgentInitRelayCandidate(PIceAgent pIceAgent)
             }
 
             MUTEX_UNLOCK(pIceAgent->lock);
+            locked = FALSE;
 
             CHK_STATUS(turnConnectionStart(pIceAgent->turnConnectionTracker.pTurnConnection));
             // use only first turn server for now. Stop the loop
-            pCurNode = NULL;
             break;
         }
     }
@@ -1441,9 +1451,7 @@ CleanUp:
 
     CHK_LOG_ERR_NV(retStatus);
 
-    if (pNewCandidate != NULL) {
-        SAFE_MEMFREE(pNewCandidate);
-    }
+    SAFE_MEMFREE(pNewCandidate);
 
     if (STATUS_FAILED(retStatus)) {
         iceAgentFatalError(pIceAgent, retStatus);
@@ -1523,7 +1531,7 @@ STATUS iceAgentConnectedStateSetup(PIceAgent pIceAgent)
 
     // schedule sending keep alive
     CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle,
-                                  0,
+                                  KVS_ICE_DEFAULT_TIMER_START_DELAY,
                                   KVS_ICE_SEND_KEEP_ALIVE_INTERVAL,
                                   iceAgentSendKeepAliveTimerCallback,
                                   (UINT64) pIceAgent,
@@ -1588,14 +1596,8 @@ STATUS iceAgentReadyStateSetup(PIceAgent pIceAgent)
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
 
-    // stop timer task and reschedule one with lower frequency.
-    CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->iceAgentStateTimerTask, (UINT64) pIceAgent));
-    CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle,
-                                  0,
-                                  KVS_ICE_STATE_READY_TIMER_POLLING_INTERVAL,
-                                  iceAgentStateTransitionTimerCallback,
-                                  (UINT64) pIceAgent,
-                                  &pIceAgent->iceAgentStateTimerTask));
+    CHK_STATUS(timerQueueUpdateTimerPeriod(pIceAgent->timerQueueHandle, (UINT64) pIceAgent,
+                                           pIceAgent->iceAgentStateTimerTask, KVS_ICE_STATE_READY_TIMER_POLLING_INTERVAL));
 
     // find nominated pair
     CHK_STATUS(doubleListGetHeadNode(pIceAgent->iceCandidatePairs, &pCurNode));
@@ -1630,7 +1632,7 @@ STATUS iceAgentReadyStateSetup(PIceAgent pIceAgent)
         DLOGD("Relayed candidate is not selected. Turn allocation will be freed");
         CHK_STATUS(turnConnectionShutdown(pIceAgent->turnConnectionTracker.pTurnConnection, 0));
         pIceAgent->turnConnectionTracker.freeTurnConnectionEndTime = GETTIME() + KVS_ICE_TURN_CONNECTION_SHUTDOWN_TIMEOUT;
-        CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle, 0, HUNDREDS_OF_NANOS_IN_A_SECOND,
+        CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle, KVS_ICE_DEFAULT_TIMER_START_DELAY, HUNDREDS_OF_NANOS_IN_A_SECOND,
                                       iceAgentFreeTurnConnectionTimerCallback, (UINT64) &pIceAgent->turnConnectionTracker,
                                       &pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId));
     }
